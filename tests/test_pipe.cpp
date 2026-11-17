@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <cerrno>
+#include <filesystem>
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <system_error>
@@ -15,6 +16,17 @@ namespace {
 
 bool is_open(int fd) {
     return ::fcntl(fd, F_GETFD) != -1;
+}
+
+// The iterator itself holds one descriptor, so both measurements include it.
+int open_fd_count() {
+    std::error_code error;
+    int count = 0;
+    for(const auto &entry : std::filesystem::directory_iterator("/proc/self/fd", error)) {
+        (void)entry;
+        ++count;
+    }
+    return error ? -1 : count;
 }
 
 } // namespace
@@ -118,4 +130,102 @@ TEST(Pipe, ReportsCreationFailureWithOperatingSystemError) {
     ASSERT_EQ(restore_result, 0);
     EXPECT_TRUE(threw_system_error);
     if(threw_system_error) EXPECT_EQ(error_code, EMFILE);
+}
+
+TEST(Pipe, MoveAssignmentClosesDestinationDescriptors) {
+    auto source = miniposix::Pipe::create();
+    auto target = miniposix::Pipe::create();
+
+    const int source_reader = source.read_end().get();
+    const int source_writer = source.write_end().get();
+    const int old_reader = target.read_end().get();
+    const int old_writer = target.write_end().get();
+    ASSERT_GE(source_reader, 0);
+    ASSERT_GE(source_writer, 0);
+    ASSERT_GE(old_reader, 0);
+    ASSERT_GE(old_writer, 0);
+    ASSERT_TRUE(is_open(old_reader));
+    ASSERT_TRUE(is_open(old_writer));
+
+    target = std::move(source);
+
+    // The destination's previous descriptors must be closed, not overwritten.
+    EXPECT_FALSE(is_open(old_reader));
+    EXPECT_FALSE(is_open(old_writer));
+    EXPECT_EQ(source.read_end().get(), -1);
+    EXPECT_EQ(source.write_end().get(), -1);
+    EXPECT_EQ(target.read_end().get(), source_reader);
+    EXPECT_EQ(target.write_end().get(), source_writer);
+    EXPECT_TRUE(is_open(source_reader));
+    EXPECT_TRUE(is_open(source_writer));
+
+    // The moved-to pipe must still work, not just hold the right integers.
+    char sent = 'M';
+    ASSERT_EQ(::write(target.write_end().get(), &sent, 1), 1);
+    char received = '\0';
+    ASSERT_EQ(::read(target.read_end().get(), &received, 1), 1);
+    EXPECT_EQ(received, sent);
+}
+
+TEST(Pipe, SelfMoveAssignmentKeepsOwnedDescriptors) {
+    auto pipe = miniposix::Pipe::create();
+    const int reader = pipe.read_end().get();
+    const int writer = pipe.write_end().get();
+    ASSERT_GE(reader, 0);
+    ASSERT_GE(writer, 0);
+
+    auto &same = pipe;
+    pipe = std::move(same);
+
+    EXPECT_EQ(pipe.read_end().get(), reader);
+    EXPECT_EQ(pipe.write_end().get(), writer);
+    EXPECT_TRUE(is_open(reader));
+    EXPECT_TRUE(is_open(writer));
+}
+
+TEST(Pipe, RepeatedCreateAndDestroyDoesNotLeakDescriptors) {
+    const int before = open_fd_count();
+    ASSERT_GE(before, 0);
+
+    for(int iteration = 0; iteration < 1000; ++iteration) {
+        auto pipe = miniposix::Pipe::create();
+        ASSERT_GE(pipe.read_end().get(), 0);
+        ASSERT_GE(pipe.write_end().get(), 0);
+    }
+
+    const int after = open_fd_count();
+    ASSERT_GE(after, 0);
+    EXPECT_EQ(after, before);
+}
+
+TEST(Pipe, CreationFailureDoesNotLeakDescriptors) {
+    struct rlimit original {};
+    ASSERT_EQ(::getrlimit(RLIMIT_NOFILE, &original), 0);
+    const int before = open_fd_count();
+    ASSERT_GE(before, 0);
+
+    struct rlimit limited = original;
+    limited.rlim_cur = 0;
+    ASSERT_EQ(::setrlimit(RLIMIT_NOFILE, &limited), 0);
+
+    bool threw_system_error = false;
+    int error_code = 0;
+    try {
+        auto pipe = miniposix::Pipe::create();
+        (void)pipe;
+    } catch(const std::system_error &error) {
+        threw_system_error = true;
+        error_code = error.code().value();
+    } catch(...) {
+        // Restore the limit below before reporting the unexpected exception.
+    }
+
+    // Measure only after restoring the limit, so /proc/self/fd can be opened.
+    const int restore_result = ::setrlimit(RLIMIT_NOFILE, &original);
+    const int after = open_fd_count();
+    EXPECT_EQ(restore_result, 0);
+    ASSERT_GE(after, 0);
+    EXPECT_TRUE(threw_system_error);
+    if(threw_system_error) EXPECT_EQ(error_code, EMFILE);
+    EXPECT_EQ(after, before);
 }

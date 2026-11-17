@@ -177,3 +177,51 @@ TEST(UniqueFd, MoveAssignmentClosesPreviousAndTransfersNewDescriptor) {
     if(is_open(old_fd)) ::close(old_fd);
     if(is_open(new_fd)) ::close(new_fd);
 }
+
+TEST(UniqueFd, ReleaseTwiceLeavesReleasedDescriptorOpen) {
+    int ends[2];
+    ASSERT_EQ(::pipe(ends), 0);
+    const int read_fd = ends[0];
+    ::close(ends[1]);
+
+    {
+        miniposix::UniqueFd owner{read_fd};
+        EXPECT_EQ(owner.release(), read_fd);
+        EXPECT_EQ(owner.release(), -1);
+        EXPECT_EQ(owner.get(), -1);
+        EXPECT_TRUE(is_open(read_fd));
+    }
+
+    // The destructor of the now-empty owner must not close the released fd.
+    EXPECT_TRUE(is_open(read_fd));
+    if(is_open(read_fd)) ::close(read_fd);
+}
+
+TEST(UniqueFd, MovedFromObjectCanAdoptNewDescriptor) {
+    int first[2];
+    int second[2];
+    ASSERT_EQ(::pipe(first), 0);
+    ASSERT_EQ(::pipe(second), 0);
+    const int first_fd = first[0];
+    const int second_fd = second[0];
+    ::close(first[1]);
+    ::close(second[1]);
+
+    {
+        miniposix::UniqueFd source{first_fd};
+        miniposix::UniqueFd target{std::move(source)};
+        ASSERT_EQ(source.get(), -1);
+        ASSERT_EQ(target.get(), first_fd);
+
+        source.reset(second_fd);
+        EXPECT_EQ(source.get(), second_fd);
+        EXPECT_TRUE(is_open(second_fd));
+        EXPECT_EQ(target.get(), first_fd);
+    }
+
+    // Both descriptors are closed exactly once, by their current owners.
+    EXPECT_FALSE(is_open(first_fd));
+    EXPECT_FALSE(is_open(second_fd));
+    if(is_open(first_fd)) ::close(first_fd);
+    if(is_open(second_fd)) ::close(second_fd);
+}
